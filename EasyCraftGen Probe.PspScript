@@ -1,0 +1,167 @@
+from PSPApp import *
+import os
+import subprocess
+import tempfile
+import time
+import uuid
+
+
+def ScriptProperties():
+    return {
+        'Author': 'EasyCraftGen',
+        'Copyright': '',
+        'Description': 'Test image, selection and external-process round trips.',
+        'Host': 'Corel PaintShop Pro',
+        'Host Version': '9.00'
+    }
+
+
+def message(environment, text, buttons, icon):
+    return App.Do(environment, 'MsgBox', {
+        'Buttons': buttons,
+        'Icon': icon,
+        'Text': text
+    })
+
+
+def document_key(document):
+    return (document.Name, document.Title)
+
+
+def new_document(before):
+    existing = [document_key(document) for document in before]
+    new = [document for document in App.Documents
+           if document_key(document) not in existing]
+    if len(new) != 1:
+        raise RuntimeError('Could not uniquely identify the new document; no further changes made.')
+    return new[0]
+
+
+def copy_in_child(source, destination):
+    powershell = os.path.join(os.environ['SystemRoot'], 'System32',
+                              'WindowsPowerShell', 'v1.0', 'powershell.exe')
+    environment = os.environ.copy()
+    environment['EASYCRAFT_PROBE_SOURCE'] = source
+    environment['EASYCRAFT_PROBE_DESTINATION'] = destination
+    command = ('Copy-Item -LiteralPath $env:EASYCRAFT_PROBE_SOURCE '
+               '-Destination $env:EASYCRAFT_PROBE_DESTINATION -ErrorAction Stop')
+    process = subprocess.Popen([powershell, '-NoProfile', '-NonInteractive',
+                                '-Command', command], env=environment)
+    deadline = time.time() + 30
+    while process.poll() is None:
+        if time.time() >= deadline:
+            process.kill()
+            process.wait()
+            raise RuntimeError('External process timed out after 30 seconds.')
+        time.sleep(0.1)
+    if process.returncode != 0:
+        raise RuntimeError('External process failed with exit code %s.' % process.returncode)
+    if not os.path.isfile(destination) or os.path.getsize(destination) == 0:
+        raise RuntimeError('External process did not produce an image.')
+    with open(source, 'rb') as original:
+        with open(destination, 'rb') as copied:
+            if original.read() != copied.read():
+                raise RuntimeError('External copy does not match the exported image.')
+
+
+def Do(Environment):
+    if not App.Documents:
+        message(Environment, 'Open an image before running the probe.',
+                App.Constants.MsgButtons.OK, App.Constants.MsgIcons.Stop)
+        return
+
+    document = App.TargetDocument
+    selection = App.Do(Environment, 'GetRasterSelectionRect', {}, document)
+    selection_type = selection['Type']
+    has_selection = selection_type != getattr(App.Constants.SelectionType, 'None')
+    text = (
+        u'Document: %s\nSize: %s x %s pixels\n'
+        u'Raster selection data: %s\n\n'
+        u'This test duplicates the document, exports a flattened PNG, runs '
+        u'PowerShell to copy it, then opens, inverts and pastes the copy as a new layer. '
+        u'An active selection will be saved and used to create a layer mask. '
+        u'The clipboard will be replaced; test files and duplicate documents remain. '
+        u'No network request is made. Use a disposable document.\n\nContinue?'
+    ) % (document.Title, document.Width, document.Height, selection)
+    if message(Environment, text, App.Constants.MsgButtons.YesNo,
+               App.Constants.MsgIcons.Question) != 1:
+        return
+    if selection_type == App.Constants.SelectionType.Floating:
+        message(Environment, 'Floating selections are not supported by this probe. Defloat and retry.',
+                App.Constants.MsgButtons.OK, App.Constants.MsgIcons.Stop)
+        return
+
+    folder = tempfile.mkdtemp(prefix='easycraftgen-psp-probe-')
+    source = os.path.join(folder, 'composite.png')
+    result = os.path.join(folder, 'result.png')
+    selection_name = 'EasyCraftGenProbe_' + uuid.uuid4().hex
+    stage = 'saving selection'
+    try:
+        if has_selection:
+            App.Do(Environment, 'SelectSaveDisk', {
+                'FileName': selection_name,
+                'Overwrite': App.Constants.Boolean.false,
+                'GeneralSettings': {'ExecutionMode': App.Constants.ExecutionMode.Silent}
+            }, document)
+
+        stage = 'duplicating document'
+        before = list(App.Documents)
+        App.Do(Environment, 'DuplicateWindow', {}, document)
+        duplicate = new_document(before)
+        stage = 'clearing selection on the duplicate (SelectNone)'
+        App.Do(Environment, 'SelectNone', {}, duplicate)
+        stage = 'checking duplicate layer count (ReturnImageInfo)'
+        info = App.Do(Environment, 'ReturnImageInfo', {}, duplicate)
+        if info['LayerNum'] > 1:
+            stage = 'merging visible layers on the duplicate (LayerMergeAll)'
+            App.Do(Environment, 'LayerMergeAll', {}, duplicate)
+        stage = 'saving the duplicate as PNG (FileSaveAs)'
+        App.Do(Environment, 'FileSaveAs', {
+            'FileName': source,
+            'FileFormat': App.Constants.FileFormat.PNG,
+            'GeneralSettings': {'ExecutionMode': App.Constants.ExecutionMode.Silent}
+        }, duplicate)
+        if not os.path.isfile(source) or os.path.getsize(source) == 0:
+            raise RuntimeError('PNG file was not created at %s.' % source)
+
+        stage = 'running external process'
+        copy_in_child(source, result)
+        stage = 'opening external result'
+        before = list(App.Documents)
+        App.Do(Environment, 'FileOpen', {
+            'FileList': [result],
+            'GeneralSettings': {'ExecutionMode': App.Constants.ExecutionMode.Silent}
+        })
+        opened = new_document(before)
+        if (opened.Width, opened.Height) != (document.Width, document.Height):
+            raise RuntimeError('Result dimensions differ from the original; it was not pasted.')
+        stage = 'copying and pasting result'
+        App.Do(Environment, 'SelectAll', {}, opened)
+        App.Do(Environment, 'NegativeImage', {}, opened)
+        App.Do(Environment, 'Copy', {}, opened)
+        App.Do(Environment, 'PasteAsNewLayer', {}, document)
+        if has_selection:
+            stage = 'restoring selection and adding mask'
+            App.Do(Environment, 'SelectLoadDisk', {
+                'FileName': selection_name,
+                'Operation': App.Constants.SelectionOperation.Replace,
+                'UpperLeft': App.Constants.Boolean.false,
+                'ClipToCanvas': App.Constants.Boolean.false,
+                'GreyMethod': App.Constants.CreateMaskFrom.Luminance,
+                'Invert': App.Constants.Boolean.false,
+                'GeneralSettings': {'ExecutionMode': App.Constants.ExecutionMode.Silent}
+            }, document)
+            App.Do(Environment, 'MaskShowSelection', {}, document)
+        selection_note = ('\nSaved selection name: %s' % selection_name) if has_selection else ''
+        message(Environment,
+                'Probe completed. Switch to the original document "%s" and inspect '
+                'its Layers palette for the pasted layer, alignment and selection mask. '
+                'Files are in:\n%s%s\n\nDuplicate and result documents remain open.' % (document.Title, folder, selection_note),
+                App.Constants.MsgButtons.OK, App.Constants.MsgIcons.Question)
+    except Exception as error:
+        selection_note = ('\nSaved selection name, if created: %s' % selection_name) if has_selection else ''
+        message(Environment, 'Probe failed while %s: %s\n\nFiles may remain in:\n%s%s\n'
+                'Duplicate documents or partial changes may remain; inspect or undo them.'
+                % (stage, error, folder, selection_note),
+                App.Constants.MsgButtons.OK, App.Constants.MsgIcons.Stop)
+        raise

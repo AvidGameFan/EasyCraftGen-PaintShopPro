@@ -1,0 +1,201 @@
+from PSPApp import *
+import json
+import math
+import numbers
+import os
+import subprocess
+import tempfile
+import uuid
+
+
+# Set this to the full path of the packaged EasyCraftGen.exe.
+EASYCRAFTGEN_EXE = r'C:\EasyCraftGen\EasyCraftGen.exe'
+
+
+def ScriptProperties():
+    return {
+        'Author': 'EasyCraftGen',
+        'Copyright': '',
+        'Description': 'Generate a fill or edit using EasyCraftGen and Easy Diffusion.',
+        'Host': 'Corel PaintShop Pro',
+        'Host Version': '9.00'
+    }
+
+
+def message(environment, text, buttons, icon):
+    return App.Do(environment, 'MsgBox', {'Buttons': buttons, 'Icon': icon, 'Text': text})
+
+
+def document_key(document):
+    return (document.Name, document.Title)
+
+
+def new_document(before):
+    existing = [document_key(document) for document in before]
+    new = [document for document in App.Documents if document_key(document) not in existing]
+    if len(new) != 1:
+        raise RuntimeError('Could not uniquely identify the new document.')
+    return new[0]
+
+
+def selection_bounds(selection, width, height):
+    rect = selection['Rect']
+    if isinstance(rect, dict):
+        coords = [rect[key] for key in ('Left', 'Top', 'Right', 'Bottom')]
+    elif len(rect) == 3 and isinstance(rect[0], (tuple, list)) and len(rect[0]) == 2:
+        left, top = rect[0]
+        rect_width, rect_height = rect[1:]
+        values = (left, top, rect_width, rect_height)
+        if any(isinstance(value, bool) or not isinstance(value, numbers.Real) or
+               math.isnan(value) or math.isinf(value) for value in values):
+            raise ValueError('Unrecognized selection rectangle: %s' % (rect,))
+        if left < 0 or top < 0 or rect_width <= 0 or rect_height <= 0 or \
+                left + rect_width > width or top + rect_height > height:
+            raise ValueError('Invalid selection rectangle: %s' % (rect,))
+        x = int(math.floor(left))
+        y = int(math.floor(top))
+        return [x, y, int(math.ceil(left + rect_width)) - x,
+                int(math.ceil(top + rect_height)) - y]
+    else:
+        coords = list(rect)
+    if len(coords) != 4 or any(not isinstance(value, numbers.Integral) for value in coords):
+        raise ValueError('Unrecognized selection rectangle: %s' % (rect,))
+    left, top, right, bottom = coords
+    if left < 0 or top < 0 or right > width or bottom > height or right <= left or bottom <= top:
+        raise ValueError('Invalid selection rectangle: %s' % (rect,))
+    return [left, top, right - left, bottom - top]
+
+
+def run_easycraftgen(folder, width, height, bounds):
+    if not os.path.isfile(EASYCRAFTGEN_EXE):
+        raise IOError('EasyCraftGen.exe not found. Edit EASYCRAFTGEN_EXE at the top of the installed script: %s' % EASYCRAFTGEN_EXE)
+    request_path = os.path.join(folder, 'request.json')
+    with open(request_path, 'w') as request:
+        json.dump({'version': 1, 'width': width, 'height': height, 'selection': bounds}, request)
+    process = subprocess.Popen([EASYCRAFTGEN_EXE, '--psp-job', request_path])
+    exit_code = process.wait()
+    if exit_code != 0:
+        raise RuntimeError('EasyCraftGen exited with code %s.' % exit_code)
+    response_path = os.path.join(folder, 'response.json')
+    if not os.path.isfile(response_path):
+        raise RuntimeError('EasyCraftGen exited without reporting a result.')
+    with open(response_path, 'r') as response_file:
+        response = json.load(response_file)
+    if response.get('version') != 1 or response.get('status') not in ('success', 'cancelled'):
+        raise RuntimeError('EasyCraftGen returned an invalid response: %s' % response)
+    if response['status'] == 'success':
+        result = os.path.join(folder, 'result.png')
+        if not os.path.isfile(result) or os.path.getsize(result) == 0:
+            raise RuntimeError('EasyCraftGen reported success without a result image.')
+    return response['status']
+
+
+def Do(Environment):
+    if not App.Documents:
+        message(Environment, 'Open an image before running EasyCraftGen.',
+                App.Constants.MsgButtons.OK, App.Constants.MsgIcons.Stop)
+        return
+    document = App.TargetDocument
+    original_width, original_height = document.Width, document.Height
+    selection = App.Do(Environment, 'GetRasterSelectionRect', {}, document)
+    selection_type = selection['Type']
+    has_selection = selection_type != getattr(App.Constants.SelectionType, 'None')
+    if selection_type == App.Constants.SelectionType.Floating:
+        message(Environment, 'Floating selections are not supported. Defloat and retry.',
+                App.Constants.MsgButtons.OK, App.Constants.MsgIcons.Stop)
+        return
+    try:
+        bounds = selection_bounds(selection, document.Width, document.Height) if has_selection else None
+    except (KeyError, TypeError, ValueError) as error:
+        message(Environment, 'Cannot interpret PaintShop Pro selection: %s\nRaw selection: %s' % (error, selection),
+                App.Constants.MsgButtons.OK, App.Constants.MsgIcons.Stop)
+        return
+    text = (u'Document: %s\nSize: %s x %s pixels\nSelection: %s\n'
+            u'Generation bounds (left, top, width, height): %s\n\n'
+            u'EasyCraftGen will open for your prompt and settings. PaintShop Pro may wait '
+            u'until it closes. Do not edit or switch the document during generation. '
+            u'The clipboard will be replaced; temporary image files and documents remain. '
+            u'Image data and prompts are sent to the configured Easy Diffusion server.\n\nContinue?'
+            % (document.Title, document.Width, document.Height, selection, bounds))
+    if message(Environment, text, App.Constants.MsgButtons.YesNo, App.Constants.MsgIcons.Question) != 1:
+        return
+
+    folder = tempfile.mkdtemp(prefix='easycraftgen-psp-')
+    source = os.path.join(folder, 'composite.png')
+    result = os.path.join(folder, 'result.png')
+    selection_name = 'EasyCraftGen_' + uuid.uuid4().hex
+    stage = 'saving selection'
+    try:
+        if has_selection:
+            App.Do(Environment, 'SelectSaveDisk', {
+                'FileName': selection_name, 'Overwrite': App.Constants.Boolean.false,
+                'GeneralSettings': {'ExecutionMode': App.Constants.ExecutionMode.Silent}
+            }, document)
+        stage = 'duplicating document'
+        before = list(App.Documents)
+        App.Do(Environment, 'DuplicateWindow', {}, document)
+        duplicate = new_document(before)
+        stage = 'clearing selection on the duplicate (SelectNone)'
+        App.Do(Environment, 'SelectNone', {}, duplicate)
+        stage = 'checking duplicate layer count (ReturnImageInfo)'
+        info = App.Do(Environment, 'ReturnImageInfo', {}, duplicate)
+        if info['LayerNum'] > 1:
+            stage = 'merging visible layers on the duplicate (LayerMergeAll)'
+            App.Do(Environment, 'LayerMergeAll', {}, duplicate)
+        stage = 'saving the duplicate as PNG (FileSaveAs)'
+        App.Do(Environment, 'FileSaveAs', {
+            'FileName': source, 'FileFormat': App.Constants.FileFormat.PNG,
+            'GeneralSettings': {'ExecutionMode': App.Constants.ExecutionMode.Silent}
+        }, duplicate)
+        if not os.path.isfile(source) or os.path.getsize(source) == 0:
+            raise RuntimeError('PNG file was not created at %s.' % source)
+
+        stage = 'running EasyCraftGen'
+        status = run_easycraftgen(folder, document.Width, document.Height, bounds)
+        selection_note = ('\nSaved selection name: %s' % selection_name) if has_selection else ''
+        if status == 'cancelled':
+            message(Environment, 'EasyCraftGen cancelled; no result was pasted.\nFiles remain in:\n%s%s'
+                    % (folder, selection_note), App.Constants.MsgButtons.OK, App.Constants.MsgIcons.Question)
+            return
+        stage = 'checking the original document'
+        if document_key(document) not in [document_key(item) for item in App.Documents]:
+            raise RuntimeError('The original document is no longer open; the result was not pasted.')
+        if (document.Width, document.Height) != (original_width, original_height):
+            raise RuntimeError('The original document dimensions changed; the result was not pasted.')
+        current_selection = App.Do(Environment, 'GetRasterSelectionRect', {}, document)
+        if current_selection != selection:
+            raise RuntimeError('The original selection changed; the result was not pasted.')
+        stage = 'opening generated result'
+        before = list(App.Documents)
+        App.Do(Environment, 'FileOpen', {
+            'FileList': [result],
+            'GeneralSettings': {'ExecutionMode': App.Constants.ExecutionMode.Silent}
+        })
+        opened = new_document(before)
+        if (opened.Width, opened.Height) != (document.Width, document.Height):
+            raise RuntimeError('Result dimensions differ from the original; it was not pasted.')
+        stage = 'copying and pasting result'
+        App.Do(Environment, 'SelectAll', {}, opened)
+        App.Do(Environment, 'Copy', {}, opened)
+        App.Do(Environment, 'PasteAsNewLayer', {}, document)
+        if has_selection:
+            stage = 'restoring selection and adding mask'
+            App.Do(Environment, 'SelectLoadDisk', {
+                'FileName': selection_name,
+                'Operation': App.Constants.SelectionOperation.Replace,
+                'UpperLeft': App.Constants.Boolean.false,
+                'ClipToCanvas': App.Constants.Boolean.false,
+                'GreyMethod': App.Constants.CreateMaskFrom.Luminance,
+                'Invert': App.Constants.Boolean.false,
+                'GeneralSettings': {'ExecutionMode': App.Constants.ExecutionMode.Silent}
+            }, document)
+            App.Do(Environment, 'MaskShowSelection', {}, document)
+        message(Environment, 'Result added to the original document "%s".\nFiles remain in:\n%s%s\n'
+                'Duplicate and result documents remain open.' % (document.Title, folder, selection_note),
+                App.Constants.MsgButtons.OK, App.Constants.MsgIcons.Question)
+    except Exception as error:
+        selection_note = ('\nSaved selection name, if created: %s' % selection_name) if has_selection else ''
+        message(Environment, 'EasyCraftGen failed while %s: %s\nFiles remain in:\n%s%s\n'
+                'Partial changes may remain; inspect or undo them.' % (stage, error, folder, selection_note),
+                App.Constants.MsgButtons.OK, App.Constants.MsgIcons.Stop)
+        raise
